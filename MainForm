@@ -1,0 +1,476 @@
+using System;
+using System.Collections;
+using System.Data.OleDb;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows.Forms;
+using System.Xml;
+using Microsoft.Office.Interop.Excel;
+using ComponentFactory.Krypton.Toolkit;
+using Microsoft.Win32;
+using System.Management;
+//create by feng.W.Q ---------date:2012-08-18
+
+namespace SendMail
+{
+    public partial class MainForm : KryptonForm
+    {
+        public MainForm()
+        {
+            InitializeComponent();
+        }
+        public ArrayList paths = new ArrayList();//保存附件地址
+        /// <summary>
+        /// 窗体加载
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void MainForm_Load(object sender, EventArgs e)
+        {
+            RegistryKey retkey = Microsoft.Win32.Registry.CurrentUser.OpenSubKey("software", true).CreateSubKey("FWQ").CreateSubKey("FWQ.INI");
+
+            //读取注册码
+            string[] regcode = retkey.GetSubKeyNames();
+            //if (regcode.Length == 0 || (regcode.Length>=1 && regcode[0] != Register.getRegNum()))
+            //{
+            //    this.Text += "[当前为未注册版本,只能批量发送5条数据]";
+            //}
+            //else
+            //{
+            //    this.Text += "[已注册]";
+            //}
+            //设置加载时的邮箱设置状态
+            RememberState();
+        }
+
+
+        #region 加载EXCEL表 EventArgs
+        /// <summary>
+        /// 加载EXCEL表
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void btn_LoadExcel_Click(object sender, EventArgs e)
+        {
+            string worksheetname = string.Empty;
+            try
+            {
+
+           
+            #region 导入本地Excel文件
+
+            //导入本地文件
+            OpenFileDialog file = new OpenFileDialog();
+            file.Filter = "文档(*.xls)|*.xls";
+            if (file.ShowDialog() == DialogResult.OK)
+
+                //判断有没有文件导入  
+                if (file.FileName.Length == 0)
+                {
+                    KryptonMessageBox.Show("请选择要导入的文件", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+            //判断文件名为空时候不报错，返回
+            if (string.IsNullOrEmpty(file.FileName))
+            {
+                return;
+            }
+            #endregion
+
+            #region 获取Excel的工作表名称
+
+            //创建Excel实例，获取worksheet Name  
+            Microsoft.Office.Interop.Excel.Application oExcel = new Microsoft.Office.Interop.Excel.Application();
+            object objMissing = System.Reflection.Missing.Value;
+            Workbook myBook = (Workbook)oExcel.Workbooks.Open(file.FileName, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing, objMissing);
+            Sheets sheets = myBook.Worksheets;
+            Worksheet worksheet = (Worksheet)sheets.get_Item(1);
+            worksheetname = worksheet.Name;//获取worksheet Name  
+            oExcel.Quit();
+
+            #endregion
+
+            //将Excel表中的数据导入到Datatable中 
+            System.Data.DataTable table = LoadExcelToDataTable(file.FileName, worksheetname);
+
+            //给datagridview控件赋值
+            DG_Excel.DataSource = table;
+
+            //更改状态
+            if (DG_Excel == null || DG_Excel.Rows.Count < 1)
+            { lbl_sendState.Text = "EXCEL没有数据，请重新加载..."; }
+            else
+            {
+                lbl_sendState.Text = "EXCEL文件加载完成，" + DG_Excel.Rows.Count + "条数据等待发送....";
+            }
+            All.success = 0;
+            All.fail = 0;
+            }
+            catch (Exception)
+            {
+                KryptonMessageBox.Show("您选择的EXCEL文件格式不正确！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+        }
+        #endregion
+
+        #region 批量发送邮件 EventArgs
+        /// <summary>
+        ///  批量发送邮件
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void btn_SendMails_Click(object sender, EventArgs e)
+        {
+            if (DG_Excel == null || DG_Excel.Rows.Count < 1)
+            {
+                KryptonMessageBox.Show("请先加载EXCEL工资表数据！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            //发送邮件前的验证（此为简单验证）
+            if (string.IsNullOrEmpty(tb_Mail.Text) || MailText(tb_Mail.Text.Trim()) == false)
+            {
+                KryptonMessageBox.Show("请输入正确的邮箱账号！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            if (string.IsNullOrEmpty(tb_Pwd.Text))
+            {
+                KryptonMessageBox.Show("请输入邮箱密码！");
+                return;
+            }
+            #region 验证是否已注册
+            RegistryKey retkey = Microsoft.Win32.Registry.CurrentUser.OpenSubKey("software", true).CreateSubKey("FWQ").CreateSubKey("FWQ.INI");
+
+            //读取注册码
+            string[] regcode = retkey.GetSubKeyNames();
+
+            if (DG_Excel.RowCount > 5 && regcode.Length == 0)
+            {
+                string aa = Register.getRegNum();
+                if (KryptonMessageBox.Show("您现在使用的是试用版，最多只能发送5条数据，现在注册？", "提示", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                {
+                    Reg reg = new Reg();
+                    reg.ShowDialog();
+                }
+                return;
+            } 
+            #endregion
+            
+            //逐条发送，多线程方式
+            for (int i = 0; i < DG_Excel.Rows.Count; i++)
+            {
+                //获取页面配置信息
+                string stmpStr = cbx_SMTP.SelectedItem.ToString();//发送服务器
+                string fromStr = tb_Mail.Text;//发件人邮箱
+                string pwdStr = tb_Pwd.Text;//发件人邮箱密码
+                string MailColName = System.Configuration.ConfigurationManager.AppSettings["MailColName"];//获取config配置的邮箱列名
+                if (string.IsNullOrEmpty(DG_Excel.Rows[i].Cells[MailColName].Value.ToString()))
+                {
+                    All.fail++;
+                    continue;
+                }
+                string toMail = DG_Excel.Rows[i].Cells[MailColName].Value.ToString();//收件人邮箱
+
+                //调用邮件发送方法
+                mailunit mu = new mailunit(stmpStr, fromStr, pwdStr, toMail,
+                    DateTime.Now.Year.ToString() + "年" + DG_Excel.Rows[i].Cells["月份"].Value.ToString() + "月" + tb_title.Text + "_" + DG_Excel.Rows[i].Cells["姓名"].Value.ToString(),
+                    MailContent(i) + "</br>" + Rtxt_Note.Text, paths);
+
+                //调用方法创建线程
+                Thread mythread = new Thread(new ThreadStart(mu.SendMail2));
+
+                //启动
+                mythread.Start();
+            }
+            //防止界面显示的发送信息和执行不同步，让线程休息等待0.1秒
+            Thread.Sleep(100);      //当前线程（主线程）休眠，等待子线程mythread运行一会
+
+            //开始逐条处理
+            while (All.runing != 0)
+            {
+                System.Windows.Forms.Application.DoEvents();//while循环操作且需要实时地显示某个中间结果lbl_sendState，这时候就需要使用到System.Windows.Forms.Application.DoEvents方法。
+
+                lbl_sendState.Text = "发送成功：" + All.success.ToString() + "条  发送失败：" + All.fail.ToString() + "条";
+            }
+            lbl_sendState.Text = "【结果】发送成功：" + All.success.ToString() + "条  发送失败：" + All.fail.ToString() + "条";
+
+            //发送完成后状态清零
+            All.success = 0;
+            All.fail = 0;
+        }
+        #endregion
+
+        #region 记住的状态checkbox 读写config文件 EventArgs
+        /// <summary>
+        /// 记住帐号判断（修改app.config配置文件的值）
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void cb_Name_CheckedChanged(object sender, EventArgs e)
+        {
+            if (cb_Name.Checked == true)
+            {
+                SetValue("RememberName", "0");
+                SetValue("MailName", tb_Mail.Text);
+            }
+            else
+            {
+                SetValue("RememberName", "1");
+            }
+        }
+
+        /// <summary>
+        /// 记住密码判断
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void cb_Pwd_CheckedChanged(object sender, EventArgs e)
+        {
+            if (cb_Pwd.Checked == true)
+            {
+                SetValue("RememberPwd", "0");
+                SetValue("MailPwd", tb_Pwd.Text);
+            }
+            else
+            {
+                SetValue("RememberPwd", "1");
+            }
+        }
+
+        /// <summary>
+        /// 记住服务器判断
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void cb_SMTP_CheckedChanged(object sender, EventArgs e)
+        {
+            if (cb_SMTP.Checked == true)
+            {
+                SetValue("RememberSMTP", "0");
+                SetValue("SMTPID", cbx_SMTP.SelectedItem.ToString());
+            }
+            else
+            {
+                SetValue("RememberSMTP", "1");
+            }
+        }
+
+        /// <summary>
+        ///method：修改config文件关于记住状态（邮箱帐号，密码，服务器）的配置值
+        /// </summary>
+        /// <param name="AppKey"></param>
+        /// <param name="AppValue"></param>
+        public static void SetValue(string AppKey, string AppValue)
+        {
+            XmlDocument xDoc = new XmlDocument();
+            //获取可执行文件的路径和名称 
+            xDoc.Load(System.Windows.Forms.Application.ExecutablePath + ".config");
+            XmlNode xNode;
+            XmlElement xElem1;
+            XmlElement xElem2;
+            xNode = xDoc.SelectSingleNode("//appSettings");
+            xElem1 = (XmlElement)xNode.SelectSingleNode("//add[@key='" + AppKey + "']");
+            if (xElem1 != null) xElem1.SetAttribute("value", AppValue);
+            else
+            {
+                xElem2 = xDoc.CreateElement("add");
+                xElem2.SetAttribute("key", AppKey);
+                xElem2.SetAttribute("value", AppValue);
+                xNode.AppendChild(xElem2);
+            }
+            xDoc.Save(System.Windows.Forms.Application.ExecutablePath + ".config");
+        }
+        #endregion
+
+        #region 关闭应用程序 EventArgs
+        /// <summary>
+        /// 关闭应用程序
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void kbtn_close_Click(object sender, EventArgs e)
+        {
+            if (KryptonMessageBox.Show("是否确定关闭程序?", "提示", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            {
+                this.Close();
+                System.Windows.Forms.Application.Exit();
+            }
+        }
+
+        #endregion
+
+        #region 帮助说明 EventArgs
+
+        /// <summary>
+        /// 帮助说明
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void kbtn_help_Click(object sender, EventArgs e)
+        {
+            Help help = new Help();
+            help.Show();
+        }
+        #endregion
+
+        #region 测试连接（验证邮箱帐号密码） EventArgs
+        /// <summary>
+        /// 测试连接（验证邮箱帐号密码） 
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void kbtn_test_Click(object sender, EventArgs e)
+        {
+            //对象实例化
+            SendMail sm = new SendMail();
+            try
+            {
+                //调用方法判断
+                if (sm.CheckSmtp(cbx_SMTP.SelectedItem.ToString(), 25, tb_Mail.Text, tb_Pwd.Text))
+                {
+                    KryptonMessageBox.Show("测试连接成功！", "测试结果", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    KryptonMessageBox.Show("测试连接失败！", "测试结果", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                KryptonMessageBox.Show(ex.Message, "提示", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+          
+        }
+        #endregion
+
+        #region 生成HTML格式工资单 Method
+        /// <summary>
+        /// 生成HTML格式工资单
+        /// </summary>
+        /// <param name="toMail">收件人</param>
+        /// <param name="RowNum">当前收件人在datagriew中的行（包装成表格形式）</param>
+        /// <returns></returns>
+        private string MailContent(int RowNum)
+        {
+            StringBuilder sb = new StringBuilder();
+            int cols = DG_Excel.ColumnCount;
+            sb.Append("<table width='100%' border='1'  cellspacing='0'  style='BORDER-COLLAPSE: collapse' borderColor=#000000  align=center bgColor=#ffffff >");
+            sb.Append("<TBODY><tr bgcolor='#d7e4bc' bordercolor='#000000' style='border-collapse:collapse;'>");
+            for (int i = 0; i < cols; i++)
+            {
+                sb.Append("<td>" + DG_Excel.Columns[i].HeaderText + "</td>");
+            }
+            sb.Append("</tr>");
+
+
+            sb.Append("<tr bordercolor='#000000'>");
+            for (int i = 0; i < cols; i++)
+            {
+                sb.Append("<td>" + DG_Excel.Rows[RowNum].Cells[i].Value.ToString() + "</td>");
+            }
+            sb.Append("</tr>");
+            sb.Append("</TBODY></table>");
+            //返回
+            return sb.ToString();
+        }
+        #endregion
+
+        #region 正则验证邮箱 Method
+        /// <summary>
+        /// 正则验证邮箱
+        /// </summary>
+        /// <param name="input"></param>
+        /// <returns></returns>
+        public bool MailText(string input)
+        {
+            Regex re = new Regex(@"^[a-zA-Z0-9_]\w*?@\w+?\.(com|net|cn|org|com\.cn)$");
+            return re.IsMatch(input);
+        }
+        #endregion
+
+        #region 邮箱设置的状态 Method
+        /// <summary>
+        /// 邮箱设置的状态
+        /// </summary>
+        private void RememberState()
+        {
+            if (System.Configuration.ConfigurationManager.AppSettings["RememberName"] == "0")
+            {
+                tb_Mail.Text = System.Configuration.ConfigurationManager.AppSettings["MailName"];
+                cb_Name.Checked = true;
+            }
+            if (System.Configuration.ConfigurationManager.AppSettings["RememberPwd"] == "0")
+            {
+                tb_Pwd.Text = System.Configuration.ConfigurationManager.AppSettings["MailPwd"];
+                cb_Pwd.Checked = true;
+            }
+            if (System.Configuration.ConfigurationManager.AppSettings["RememberSMTP"] == "0")
+            {
+                cbx_SMTP.SelectedItem = System.Configuration.ConfigurationManager.AppSettings["SMTPID"];
+                cb_SMTP.Checked = true;
+            }
+        }
+        #endregion
+
+        #region 验证试用次数 Method
+        /// <summary>
+        /// 验证试用次数 Method
+        /// </summary>
+        private void thCheckRegist()
+        {
+
+            //else
+            //{
+            //    Int32 tLong;
+            //    try
+            //    {
+            //        tLong = (Int32)Registry.GetValue("HKEY_LOCAL_MACHINE\\SOFTWARE\\SendMail", "UseTimes", 0);
+            //        KryptonMessageBox.Show("感谢您已使用了" + tLong + "次", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            //    }
+            //    catch
+            //    {
+            //        Registry.SetValue("HKEY_LOCAL_MACHINE\\SOFTWARE\\SendMail", "UseTimes", 0, RegistryValueKind.DWord);
+            //        KryptonMessageBox.Show("欢迎新用户使用本软件", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            //    }
+            //    tLong = (Int32)Registry.GetValue("HKEY_LOCAL_MACHINE\\SOFTWARE\\SendMail", "UseTimes", 0);
+            //    if (tLong < 50000)
+            //    {
+            //        int Times = tLong + 1;
+            //        Registry.SetValue("HKEY_LOCAL_MACHINE\\SOFTWARE\\SendMail", "UseTimes", Times);
+            //    }
+            //    else
+            //    {
+            //        KryptonMessageBox.Show("试用次数已到", "警告", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            //        System.Windows.Forms.Application.Exit();
+            //    }
+            //}
+        }
+        #endregion
+
+        #region 加载Excel表到DataTable，跟原始Excel表形式一样，需要筛选自己有用的数据  Method
+        /// <summary> 
+        /// 
+        /// 加载Excel表到DataTable，跟原始Excel表形式一样，需要筛选自己有用的数据  
+        /// </summary>   
+        ///  <param name="filename">需要读取的Excel文件路径</param>  
+        ///  <param name="sheetname">工作表名称</param>  
+        ///  <returns>DataTable</returns>  
+        public static System.Data.DataTable LoadExcelToDataTable(string filename, string worksheetname)
+        {
+            System.Data.DataTable table;           //连接字符串 
+            String sConnectionString = "Provider=Microsoft.Jet.OLEDB.4.0;" + "Data Source=" + filename + ";" + "Extended Properties=\"Excel 8.0;HDR=Yes;IMEX=1\"";
+            OleDbConnection myConn = new OleDbConnection(sConnectionString);
+            string strCom = " SELECT * FROM [" + worksheetname + "$]";
+            myConn.Open();
+            OleDbDataAdapter myCommand = new OleDbDataAdapter(strCom, myConn);
+            table = new System.Data.DataTable();
+            myCommand.Fill(table);
+            myConn.Close();
+            return table;
+        }
+        #endregion
+
+    
+    }
+}
